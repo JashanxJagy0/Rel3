@@ -81,11 +81,11 @@ MIN_BALANCE = 0.1
 DEBUG_EMOJI_GAMES = False  # Set to True to enable detailed emoji game logging
 
 # Helper bot animation timing (faster than main bot)
-HELPER_BOT_ANIMATION_DELAY = 0.3  # Seconds to wait after helper bot sends dice
+HELPER_BOT_ANIMATION_DELAY = 0.3  # Seconds to wait after helper bot sends animation (dice, slots, darts, etc.)
 
 # --- Username Bonus Configuration ---
 # Users who add this tag/username in their Telegram name get 5% extra on all bonuses (rk, weekly, monthly)
-BOT_USERNAME_TAG = ""  # Fill in the bot username tag users should add to their name (e.g. "@YourBot")
+BOT_USERNAME_TAG = ""  # Fill in the tag/text users should add to their Telegram name (case-insensitive, e.g. "CasinoBot")
 
 # --- House Edge Configuration ---
 # Different house edges for different game categories
@@ -111,7 +111,9 @@ GAME_TYPE_TO_EDGE_CATEGORY = {
     "dice_roll": "originals", "predict": "originals", "limbo": "originals",
     "blackjack": "originals", "coin_flip": "originals", "roulette": "originals",
     "mines": "originals", "tower": "originals", "keno": "originals",
-    "highlow": "originals", "coinchain": "originals", "scratch": "originals",
+    "highlow": "originals", "coinchain": "originals", "coin_chain": "originals",
+    "scratch": "originals", "crash": "originals", "plinko": "originals",
+    "wheel": "originals",
     "pvb_dice": "originals", "pvb_darts": "originals", "pvb_goal": "originals",
     "pvb_bowl": "originals",
 }
@@ -4645,11 +4647,11 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
     # Weighted wager = bet_amount * house_edge_rate (weights higher-edge games more)
     weighted_wager = amount * house_edge_rate
     
-    # Net loss for this bet
+    # Net loss for this bet (positive = loss, negative = profit)
     if win:
-        net_loss_this_bet = amount - (amount * multiplier)  # Negative if won
+        net_loss_this_bet = amount - (amount * multiplier)  # Negative when user wins (profit)
     else:
-        net_loss_this_bet = amount  # Positive (lost the bet)
+        net_loss_this_bet = amount  # Positive (user lost the bet amount)
     
     # Update weekly stats
     stats.setdefault("weekly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
@@ -4695,6 +4697,12 @@ def get_username_bonus_guidance():
         return (f"\n\n💡 <b>Tip:</b> Add <code>{BOT_USERNAME_TAG}</code> to your Telegram name "
                 f"to get <b>5% extra</b> on all bonus claims (rakeback, weekly, monthly)!")
     return ""
+
+def get_user_tier(user_id):
+    """Get the user's VIP tier name (e.g. 'Bronze', 'Silver', etc.)."""
+    level_data = get_user_level(user_id)
+    tier = level_data["name"].split()[0] if level_data["name"] != "None" else "Bronze"
+    return tier
 
 def update_stats_on_rain_received(user_id, amount):
     stats = user_stats[user_id]
@@ -12632,9 +12640,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
         "• <code>/stats</code>, <code>/leaderboard</code>, <code>/leaderboardrf</code>\n\n"
         "<b>🎁 Bonuses:</b>\n"
         "• <code>/daily</code> — Claim your daily bonus!\n"
-        "• <code>/weekly</code> — Claim weekly bonus (Saturdays 6PM UTC, 48h window).\n"
-        "• <code>/monthly</code> — Claim monthly bonus (15th of month, 48h window).\n"
-        "• <code>/rk</code> — Claim your accumulated rakeback.\n"
+        "• <code>/weekly</code> — Weekly VIP bonus (Sat 6PM UTC, 48h window, based on wagers &amp; losses).\n"
+        "• <code>/monthly</code> — Monthly VIP bonus (15th, 48h window, based on wagers &amp; losses).\n"
+        "• <code>/rk</code> — Claim accumulated rakeback (auto-earned per bet based on VIP tier).\n"
         "• <code>/claim &lt;code&gt;</code> — Claim a gift code.\n\n"
         "<b>🛡️ History & Info:</b>\n"
         "• <code>/escrow</code>, <code>/deals</code>, <code>/matches</code>\n"
@@ -17047,8 +17055,7 @@ async def weekly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TYP
     # If net_loss is negative (profit), the loss component is 0
     loss_component = max(0, net_loss) * 0.05
     
-    level_data = get_user_level(user.id)
-    tier = level_data["name"].split()[0] if level_data["name"] != "None" else "Bronze"
+    tier = get_user_tier(user.id)
     vip_base = VIP_BASE_REWARDS.get(tier, 0.10)
     
     bonus = vip_base + (weighted_wager * 1.0) + loss_component
@@ -17155,8 +17162,7 @@ async def monthly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TY
     # If net_loss is negative (profit), the loss component is 0
     loss_component = max(0, net_loss) * 0.05
     
-    level_data = get_user_level(user.id)
-    tier = level_data["name"].split()[0] if level_data["name"] != "None" else "Bronze"
+    tier = get_user_tier(user.id)
     vip_base = VIP_BASE_REWARDS.get(tier, 0.10)
     
     bonus = vip_base + (weighted_wager * 1.0) + loss_component
