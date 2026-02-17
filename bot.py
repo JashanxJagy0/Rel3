@@ -81,7 +81,46 @@ MIN_BALANCE = 0.1
 DEBUG_EMOJI_GAMES = False  # Set to True to enable detailed emoji game logging
 
 # Helper bot animation timing (faster than main bot)
-HELPER_BOT_ANIMATION_DELAY = 0.5  # Seconds to wait after helper bot sends dice
+HELPER_BOT_ANIMATION_DELAY = 0.3  # Seconds to wait after helper bot sends dice
+
+# --- Username Bonus Configuration ---
+# Users who add this tag/username in their Telegram name get 5% extra on all bonuses (rk, weekly, monthly)
+BOT_USERNAME_TAG = ""  # Fill in the bot username tag users should add to their name (e.g. "@YourBot")
+
+# --- House Edge Configuration ---
+# Different house edges for different game categories
+HOUSE_EDGES = {
+    "pvp": 0.005,        # 0.5% - PvP Games (/p, Emoji Duels)
+    "originals": 0.01,   # 1.0% - Originals (Dice, Plinko, etc.)
+    "slots": 0.04,       # 4.0% - Slots (/sl)
+}
+
+# Map game_type strings to house edge categories
+GAME_TYPE_TO_EDGE_CATEGORY = {
+    # PvP games
+    "pvp_dice": "pvp", "pvp_darts": "pvp", "pvp_goal": "pvp", "pvp_bowl": "pvp",
+    "xdxw_dice": "pvp", "xdxw_darts": "pvp", "xdxw_goal": "pvp", "xdxw_bowl": "pvp",
+    "group_challenge_dice": "pvp", "group_challenge_darts": "pvp",
+    "group_challenge_goal": "pvp", "group_challenge_bowl": "pvp",
+    "single_emoji_darts": "pvp", "single_emoji_soccer": "pvp",
+    "single_emoji_basket": "pvp", "single_emoji_bowling": "pvp",
+    "single_emoji_slot": "pvp",
+    # Slots
+    "slots": "slots",
+    # Originals (default category for everything else)
+    "dice_roll": "originals", "predict": "originals", "limbo": "originals",
+    "blackjack": "originals", "coin_flip": "originals", "roulette": "originals",
+    "mines": "originals", "tower": "originals", "keno": "originals",
+    "highlow": "originals", "coinchain": "originals", "scratch": "originals",
+    "pvb_dice": "originals", "pvb_darts": "originals", "pvb_goal": "originals",
+    "pvb_bowl": "originals",
+}
+
+# VIP Base Rewards for weekly/monthly bonuses (per tier)
+VIP_BASE_REWARDS = {
+    "Bronze": 0.10, "Silver": 0.25, "Gold": 0.50, "Platinum": 1.00,
+    "Diamond": 2.00, "Emerald": 3.50, "Ruby": 5.00, "Sapphire": 7.50
+}
 
 # --- Links Configuration ---
 # Add your community links here
@@ -4124,6 +4163,9 @@ async def ensure_user_in_wallets(user_id: int, username: str = None, referrer_id
             "last_weekly_claim": None, # NEW
             "last_monthly_claim": None, # NEW
             "last_rakeback_claim_wager": 0.0, # NEW
+            "rakeback_balance": 0.0, # NEW: Accumulated rakeback from house edge
+            "weekly_stats": {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None}, # NEW
+            "monthly_stats": {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None}, # NEW
             "claimed_gift_codes": [], # NEW
             "claimed_level_rewards": [], # NEW: For level system
             "unwagered_deposit": 0.0, # NEW: Deposits that need 2x wagering
@@ -4541,7 +4583,7 @@ def calculate_required_wager(user_id):
     
     return total_needed, breakdown
 
-def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier=0, context=None):
+def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier=0, context=None, game_type=None):
     stats = user_stats[user_id]
     stats["bets"]["count"] += 1
     stats["bets"]["amount"] += amount
@@ -4552,7 +4594,8 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
     # NEW: House balance update
     global bot_settings
     win_amount = 0
-    game_type = game_sessions.get(game_id, {}).get('game_type', 'unknown')
+    if game_type is None:
+        game_type = game_sessions.get(game_id, {}).get('game_type', 'unknown')
     
     if win:
         winnings = amount * multiplier
@@ -4584,6 +4627,40 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
         "timestamp": str(datetime.now(timezone.utc))
     })
     
+    # --- House Edge Bonus System ---
+    # Determine house edge category and calculate rakeback
+    edge_category = GAME_TYPE_TO_EDGE_CATEGORY.get(game_type, "originals")
+    house_edge_rate = HOUSE_EDGES.get(edge_category, HOUSE_EDGES["originals"])
+    edge_amount = amount * house_edge_rate
+    
+    # Get user's VIP rakeback percentage
+    level_data = get_user_level(user_id)
+    vip_rakeback_pct = level_data["rakeback_percentage"] / 100.0  # e.g. 1% -> 0.01
+    rakeback_to_add = edge_amount * vip_rakeback_pct
+    
+    # Accumulate rakeback balance
+    stats.setdefault("rakeback_balance", 0.0)
+    stats["rakeback_balance"] += rakeback_to_add
+    
+    # Weighted wager = bet_amount * house_edge_rate (weights higher-edge games more)
+    weighted_wager = amount * house_edge_rate
+    
+    # Net loss for this bet
+    if win:
+        net_loss_this_bet = amount - (amount * multiplier)  # Negative if won
+    else:
+        net_loss_this_bet = amount  # Positive (lost the bet)
+    
+    # Update weekly stats
+    stats.setdefault("weekly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
+    stats["weekly_stats"]["weighted_wager"] += weighted_wager
+    stats["weekly_stats"]["net_loss"] += net_loss_this_bet
+    
+    # Update monthly stats
+    stats.setdefault("monthly_stats", {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": None})
+    stats["monthly_stats"]["weighted_wager"] += weighted_wager
+    stats["monthly_stats"]["net_loss"] += net_loss_this_bet
+    
     # NEW: Update leaderboards
     update_leaderboards(user_id, amount, win_amount, game_type, multiplier)
 
@@ -4594,6 +4671,30 @@ def update_stats_on_bet(user_id, game_id, amount, win, pvp_win=False, multiplier
     asyncio.create_task(check_and_award_achievements(user_id, context, multiplier))
     # NEW: Check for level up
     asyncio.create_task(check_and_award_level_up(user_id, context))
+
+def check_username_bonus(user_id):
+    """Check if a user has the bot username tag in their Telegram name.
+    Returns True if the user gets the 5% extra bonus."""
+    if not BOT_USERNAME_TAG:
+        return False
+    stats = user_stats.get(user_id, {})
+    first_name = stats.get("userinfo", {}).get("first_name", "")
+    username = stats.get("userinfo", {}).get("username", "")
+    tag = BOT_USERNAME_TAG.lower()
+    return tag in (first_name or "").lower() or tag in (username or "").lower()
+
+def apply_username_bonus(amount, user_id):
+    """Apply 5% extra bonus if user has bot username in their name."""
+    if check_username_bonus(user_id):
+        return amount * 1.05
+    return amount
+
+def get_username_bonus_guidance():
+    """Return guidance message for users to add bot username to their name."""
+    if BOT_USERNAME_TAG:
+        return (f"\n\n💡 <b>Tip:</b> Add <code>{BOT_USERNAME_TAG}</code> to your Telegram name "
+                f"to get <b>5% extra</b> on all bonus claims (rakeback, weekly, monthly)!")
+    return ""
 
 def update_stats_on_rain_received(user_id, amount):
     stats = user_stats[user_id]
@@ -7381,9 +7482,12 @@ async def dice_roll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
     try:
-        dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji="🎲")
+        dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, "🎲")
         dice_result = dice_msg.dice.value
-        await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+        if used_helper:
+            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+        else:
+            await asyncio.sleep(animation_wait)
     except Exception as e:
         logging.error(f"Error sending dice in dice_roll_command: {e}")
         # Refund the bet on error
@@ -8146,8 +8250,12 @@ async def slots_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nonce = 1
 
     await update.message.reply_text(f"🎰 Spinning the slots...")
-    slot_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji="🎰")
+    slot_msg, used_helper = await smart_roll(context, update.effective_chat.id, "🎰")
     slot_value = slot_msg.dice.value
+    if used_helper:
+        await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+    else:
+        await asyncio.sleep(3)  # Standard slot animation wait
 
     win = False
     multiplier = 0
@@ -8794,11 +8902,14 @@ async def play_single_emoji_game(update: Update, context: ContextTypes.DEFAULT_T
     user_wallets[user.id] -= bet_amount_usd
     save_user_data(user.id)
     
-    # Send the dice/emoji animation
-    dice_msg = await update.message.reply_dice(emoji=game_config['dice_type'])
+    # Send the dice/emoji animation using helper bot in groups
+    dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, game_config['dice_type'])
     
     # Wait for the animation to complete
-    await asyncio.sleep(4)
+    if used_helper:
+        await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+    else:
+        await asyncio.sleep(4)
     
     # Check if won
     dice_value = dice_msg.dice.value
@@ -9399,9 +9510,12 @@ async def predict_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     animation_wait = await smart_rate_limit(update.effective_chat.id, chat_type)
     try:
-        dice_msg = await context.bot.send_dice(chat_id=update.effective_chat.id, emoji="🎲")
+        dice_msg, used_helper = await smart_roll(context, update.effective_chat.id, "🎲")
         outcome = dice_msg.dice.value
-        await asyncio.sleep(animation_wait)  # Smart wait based on chat type
+        if used_helper:
+            await asyncio.sleep(HELPER_BOT_ANIMATION_DELAY)
+        else:
+            await asyncio.sleep(animation_wait)
     except Exception as e:
         logging.error(f"Error sending dice in predict_command: {e}")
         # Refund the bet on error
@@ -12518,9 +12632,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
         "• <code>/stats</code>, <code>/leaderboard</code>, <code>/leaderboardrf</code>\n\n"
         "<b>🎁 Bonuses:</b>\n"
         "• <code>/daily</code> — Claim your daily bonus!\n"
-        "• <code>/weekly</code> — Claim weekly wager bonus (0.5%).\n"
-        "• <code>/monthly</code> — Claim monthly wager bonus (0.3%).\n"
-        "• <code>/rk</code> — Claim your instant rakeback (0.01%).\n"
+        "• <code>/weekly</code> — Claim weekly bonus (Saturdays 6PM UTC, 48h window).\n"
+        "• <code>/monthly</code> — Claim monthly bonus (15th of month, 48h window).\n"
+        "• <code>/rk</code> — Claim your accumulated rakeback.\n"
         "• <code>/claim &lt;code&gt;</code> — Claim a gift code.\n\n"
         "<b>🛡️ History & Info:</b>\n"
         "• <code>/escrow</code>, <code>/deals</code>, <code>/matches</code>\n"
@@ -12568,7 +12682,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE, from_
     if from_callback:
         await safe_edit_message(update.callback_query, help_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup, disable_web_page_preview=True)
     else:
-        sent_message = await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup, disable_web_page_preview=True)
+        # Use helper bot in groups for info commands
+        is_group = update.effective_chat.type in ["group", "supergroup"]
+        if is_group and helper_bot:
+            try:
+                sent_message = await helper_bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=help_text, parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup, disable_web_page_preview=True
+                )
+            except Exception as e:
+                logging.warning(f"Helper bot failed for /help: {e}")
+                sent_message = await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup, disable_web_page_preview=True)
+        else:
+            sent_message = await update.message.reply_text(help_text, parse_mode=ParseMode.HTML, reply_markup=reply_markup, disable_web_page_preview=True)
         # Set ownership when sending with keyboard
         if reply_markup:
             set_menu_owner(sent_message, user.id)
@@ -13650,6 +13777,19 @@ async def leaderboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     if from_callback:
         await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
     else:
+        # Use helper bot in groups for info commands
+        if is_group and helper_bot:
+            try:
+                sent_message = await helper_bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=msg, parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup
+                )
+                if reply_markup:
+                    set_menu_owner(sent_message, user_id)
+                return
+            except Exception as e:
+                logging.warning(f"Helper bot failed for /leaderboard: {e}")
         sent_message = await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
         # Set ownership when sending with keyboard
         if reply_markup:
@@ -13902,15 +14042,53 @@ async def ai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompt_text = ' '.join(context.args)
 
     if not prompt_text:
-        await update.message.reply_text(
+        usage_text = (
             "How can I help you?\n\nUsage:\n"
             "• `/ai your question here`\n"
             "• Reply to a message with `/ai` to discuss it."
         )
+        # Use helper bot for usage text in groups
+        is_group = update.effective_chat.type in ["group", "supergroup"]
+        if is_group and helper_bot:
+            try:
+                await helper_bot.send_message(chat_id=update.effective_chat.id, text=usage_text)
+                return
+            except Exception as e:
+                logging.warning(f"Helper bot failed for /ai usage: {e}")
+        await update.message.reply_text(usage_text)
         return
 
     # Default to g4f for the direct /ai command
-    await process_ai_request(update, prompt_text,"g4f")
+    # In groups, use helper bot for the AI response
+    is_group = update.effective_chat.type in ["group", "supergroup"]
+    if is_group and helper_bot:
+        try:
+            status_msg = await helper_bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"🤖 Thinking with G4f..."
+            )
+            try:
+                ai_response = await g4f.ChatCompletion.create_async(
+                    model=g4f.models.default,
+                    messages=[{"role": "user", "content": prompt_text}],
+                )
+                await helper_bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg.message_id,
+                    text=ai_response
+                )
+            except Exception as e:
+                logging.error(f"AI (g4f) Error via helper bot: {e}")
+                await helper_bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg.message_id,
+                    text=f"An error occurred while contacting the AI: {e}"
+                )
+            return
+        except Exception as e:
+            logging.warning(f"Helper bot failed for /ai: {e}")
+    
+    await process_ai_request(update, prompt_text, "g4f")
 
 @check_banned
 @check_maintenance
@@ -13926,7 +14104,20 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Use the 24hr ticker endpoint for more details
     url = f"https://api.mexc.com/api/v3/ticker/24hr?symbol={pair}"
 
-    status_msg = await update.message.reply_text(f"📈 Fetching 24hr data for {pair} from MEXC...")
+    is_group = update.effective_chat.type in ["group", "supergroup"]
+    
+    # Use helper bot for status message in groups
+    if is_group and helper_bot:
+        try:
+            status_msg = await helper_bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"📈 Fetching 24hr data for {pair} from MEXC..."
+            )
+        except Exception as e:
+            logging.warning(f"Helper bot failed for /p status: {e}")
+            status_msg = await update.message.reply_text(f"📈 Fetching 24hr data for {pair} from MEXC...")
+    else:
+        status_msg = await update.message.reply_text(f"📈 Fetching 24hr data for {pair} from MEXC...")
 
     try:
         async with httpx.AsyncClient() as client:
@@ -13952,7 +14143,20 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         keyboard = [[InlineKeyboardButton("🔄 Update", callback_data=f"price_update_{pair}")]]
 
-        await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        # Edit using appropriate bot
+        if is_group and helper_bot:
+            try:
+                await helper_bot.edit_message_text(
+                    chat_id=update.effective_chat.id,
+                    message_id=status_msg.message_id,
+                    text=text, parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup(keyboard)
+                )
+            except Exception as e:
+                logging.warning(f"Helper bot failed to edit /p result: {e}")
+                await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await status_msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
     except httpx.HTTPStatusError as e:
         logging.error(f"MEXC API Error for /p command: {e.response.status_code} - {e.response.text}")
@@ -15784,7 +15988,20 @@ async def leaderboard_referral_command(update: Update, context: ContextTypes.DEF
         if ref_count > 0:
             msg += f"{i+1}. {username} - <b>{ref_count} referrals</b>\n"
 
+    # Use helper bot in groups for info commands
+    is_group = update.effective_chat.type in ["group", "supergroup"]
+    if is_group and helper_bot:
+        try:
+            await helper_bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=msg, parse_mode=ParseMode.HTML
+            )
+            return
+        except Exception as e:
+            logging.warning(f"Helper bot failed for /leaderboardrf: {e}")
+    
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
 async def post_init(application: Application):
     """
     Post initialization hook to start background tasks.
@@ -16783,28 +17000,96 @@ async def weekly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TYP
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
     stats = user_stats[user.id]
+    now = datetime.now(timezone.utc)
     
+    # Check if today is Saturday (weekday() == 5) and within 48h window
+    # Find the most recent Saturday at 6:00 PM UTC
+    days_since_saturday = (now.weekday() - 5) % 7
+    last_saturday_6pm = (now - timedelta(days=days_since_saturday)).replace(hour=18, minute=0, second=0, microsecond=0)
+    if last_saturday_6pm > now:
+        last_saturday_6pm -= timedelta(days=7)
+    
+    window_end = last_saturday_6pm + timedelta(hours=48)
+    
+    if now < last_saturday_6pm or now > window_end:
+        # Not within the claim window
+        next_saturday = last_saturday_6pm + timedelta(days=7)
+        time_until = next_saturday - now
+        msg = (f"📅 <b>Weekly Bonus</b>\n\n"
+               f"Weekly bonus is available every <b>Saturday at 6:00 PM UTC</b> for 48 hours.\n"
+               f"Next available in: <b>{time_until.days}d {time_until.seconds//3600}h</b>"
+               + get_username_bonus_guidance())
+        if from_callback:
+            await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+    
+    # Check if already claimed this period
     last_claim_str = stats.get("last_weekly_claim")
     if last_claim_str:
         last_claim_time = datetime.fromisoformat(last_claim_str)
-        if datetime.now(timezone.utc) - last_claim_time < timedelta(days=7):
-            time_left = timedelta(days=7) - (datetime.now(timezone.utc) - last_claim_time)
-            await update.message.reply_text(f"You've already claimed your weekly bonus. Try again in {time_left.days}d {time_left.seconds//3600}h.")
+        if last_claim_time >= last_saturday_6pm:
+            msg = ("✅ You've already claimed your weekly bonus this period!"
+                   + get_username_bonus_guidance())
+            if from_callback:
+                await update.callback_query.answer("Already claimed this week!", show_alert=True)
+            else:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
             return
-
-    now = datetime.now(timezone.utc)
-    one_week_ago = now - timedelta(days=7)
-    wagered_last_week = sum(h['amount'] for h in stats.get('bets', {}).get('history', []) if datetime.fromisoformat(h['timestamp']) >= one_week_ago)
     
-    bonus = wagered_last_week * 0.005 # 0.5%
+    # Calculate bonus using new formula:
+    # Bonus = VIP_Base_Reward + (Weekly_Weighted_Wager * 1.0) + (Weekly_Net_Loss * 0.05)
+    weekly_stats = stats.get("weekly_stats", {"weighted_wager": 0.0, "net_loss": 0.0})
+    weighted_wager = weekly_stats.get("weighted_wager", 0.0)
+    net_loss = weekly_stats.get("net_loss", 0.0)
     
-    if bonus > 0:
-        user_wallets[user.id] += bonus
-        stats["last_weekly_claim"] = str(now)
-        save_user_data(user.id)
-        await update.message.reply_text(f"🎉 You've claimed your weekly bonus of ${bonus:.2f} (0.5% of ${wagered_last_week:.2f} wagered).")
+    # If net_loss is negative (profit), the loss component is 0
+    loss_component = max(0, net_loss) * 0.05
+    
+    level_data = get_user_level(user.id)
+    tier = level_data["name"].split()[0] if level_data["name"] != "None" else "Bronze"
+    vip_base = VIP_BASE_REWARDS.get(tier, 0.10)
+    
+    bonus = vip_base + (weighted_wager * 1.0) + loss_component
+    
+    if bonus <= 0:
+        msg = ("You haven't wagered enough to earn a weekly bonus." + get_username_bonus_guidance())
+        if from_callback:
+            await update.callback_query.answer("No bonus to claim!", show_alert=True)
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+    
+    # Apply username bonus (5% extra if user has bot username in name)
+    final_bonus = apply_username_bonus(bonus, user.id)
+    has_bonus = check_username_bonus(user.id)
+    
+    user_wallets[user.id] += final_bonus
+    stats["last_weekly_claim"] = str(now)
+    # Reset weekly stats after claiming
+    stats["weekly_stats"] = {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": str(now)}
+    save_user_data(user.id)
+    
+    bonus_text = ""
+    if has_bonus:
+        bonus_text = f"\n🎉 <b>Username Bonus:</b> +5% (${final_bonus - bonus:.2f})"
+    
+    msg = (
+        f"📅 <b>Weekly Bonus Claimed!</b>\n\n"
+        f"💰 Amount: <b>${final_bonus:.2f}</b>{bonus_text}\n\n"
+        f"<b>Breakdown:</b>\n"
+        f"  VIP Base ({tier}): ${vip_base:.2f}\n"
+        f"  Weighted Wager: ${weighted_wager:.4f}\n"
+        f"  Net Loss Bonus: ${loss_component:.2f}"
+        + get_username_bonus_guidance()
+    )
+    
+    if from_callback:
+        keyboard = [[InlineKeyboardButton("🔙 Back to Bonuses", callback_data="main_bonuses")]]
+        await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text("You haven't wagered anything in the last 7 days to claim a weekly bonus.")
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 @check_banned
 @check_maintenance
@@ -16812,28 +17097,107 @@ async def monthly_bonus_command(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
     stats = user_stats[user.id]
+    now = datetime.now(timezone.utc)
     
+    # Check if today is the 15th and within 48h window
+    # Find the most recent 15th at 00:00 UTC
+    if now.day >= 15:
+        claim_start = now.replace(day=15, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        # Go to previous month's 15th
+        if now.month == 1:
+            claim_start = now.replace(year=now.year - 1, month=12, day=15, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            claim_start = now.replace(month=now.month - 1, day=15, hour=0, minute=0, second=0, microsecond=0)
+    
+    window_end = claim_start + timedelta(hours=48)
+    
+    if now < claim_start or now > window_end:
+        # Not within the claim window
+        if now.day >= 15 and now > window_end:
+            # Next month's 15th
+            if now.month == 12:
+                next_15th = now.replace(year=now.year + 1, month=1, day=15, hour=0, minute=0, second=0, microsecond=0)
+            else:
+                next_15th = now.replace(month=now.month + 1, day=15, hour=0, minute=0, second=0, microsecond=0)
+        else:
+            next_15th = claim_start
+        time_until = next_15th - now
+        msg = (f"🗓️ <b>Monthly Bonus</b>\n\n"
+               f"Monthly bonus is available on the <b>15th of every month</b> for 48 hours.\n"
+               f"Next available in: <b>{time_until.days}d {time_until.seconds//3600}h</b>"
+               + get_username_bonus_guidance())
+        if from_callback:
+            await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML)
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+    
+    # Check if already claimed this period
     last_claim_str = stats.get("last_monthly_claim")
     if last_claim_str:
         last_claim_time = datetime.fromisoformat(last_claim_str)
-        if datetime.now(timezone.utc) - last_claim_time < timedelta(days=30):
-            time_left = timedelta(days=30) - (datetime.now(timezone.utc) - last_claim_time)
-            await update.message.reply_text(f"You've already claimed your monthly bonus. Try again in {time_left.days}d {time_left.seconds//3600}h.")
+        if last_claim_time >= claim_start:
+            msg = ("✅ You've already claimed your monthly bonus this period!"
+                   + get_username_bonus_guidance())
+            if from_callback:
+                await update.callback_query.answer("Already claimed this month!", show_alert=True)
+            else:
+                await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
             return
-
-    now = datetime.now(timezone.utc)
-    one_month_ago = now - timedelta(days=30)
-    wagered_last_month = sum(h['amount'] for h in stats.get('bets', {}).get('history', []) if datetime.fromisoformat(h['timestamp']) >= one_month_ago)
     
-    bonus = wagered_last_month * 0.003 # 0.3%
+    # Calculate bonus using same formula as weekly but with monthly stats
+    # Bonus = VIP_Base_Reward + (Monthly_Weighted_Wager * 1.0) + (Monthly_Net_Loss * 0.05)
+    monthly_stats = stats.get("monthly_stats", {"weighted_wager": 0.0, "net_loss": 0.0})
+    weighted_wager = monthly_stats.get("weighted_wager", 0.0)
+    net_loss = monthly_stats.get("net_loss", 0.0)
     
-    if bonus > 0:
-        user_wallets[user.id] += bonus
-        stats["last_monthly_claim"] = str(now)
-        save_user_data(user.id)
-        await update.message.reply_text(f"🎉 You've claimed your monthly bonus of ${bonus:.2f} (0.3% of ${wagered_last_month:.2f} wagered).")
+    # If net_loss is negative (profit), the loss component is 0
+    loss_component = max(0, net_loss) * 0.05
+    
+    level_data = get_user_level(user.id)
+    tier = level_data["name"].split()[0] if level_data["name"] != "None" else "Bronze"
+    vip_base = VIP_BASE_REWARDS.get(tier, 0.10)
+    
+    bonus = vip_base + (weighted_wager * 1.0) + loss_component
+    
+    if bonus <= 0:
+        msg = ("You haven't wagered enough to earn a monthly bonus." + get_username_bonus_guidance())
+        if from_callback:
+            await update.callback_query.answer("No bonus to claim!", show_alert=True)
+        else:
+            await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+        return
+    
+    # Apply username bonus (5% extra if user has bot username in name)
+    final_bonus = apply_username_bonus(bonus, user.id)
+    has_bonus = check_username_bonus(user.id)
+    
+    user_wallets[user.id] += final_bonus
+    stats["last_monthly_claim"] = str(now)
+    # Reset monthly stats after claiming
+    stats["monthly_stats"] = {"weighted_wager": 0.0, "net_loss": 0.0, "last_claim": str(now)}
+    save_user_data(user.id)
+    
+    bonus_text = ""
+    if has_bonus:
+        bonus_text = f"\n🎉 <b>Username Bonus:</b> +5% (${final_bonus - bonus:.2f})"
+    
+    msg = (
+        f"🗓️ <b>Monthly Bonus Claimed!</b>\n\n"
+        f"💰 Amount: <b>${final_bonus:.2f}</b>{bonus_text}\n\n"
+        f"<b>Breakdown:</b>\n"
+        f"  VIP Base ({tier}): ${vip_base:.2f}\n"
+        f"  Weighted Wager: ${weighted_wager:.4f}\n"
+        f"  Net Loss Bonus: ${loss_component:.2f}"
+        + get_username_bonus_guidance()
+    )
+    
+    if from_callback:
+        keyboard = [[InlineKeyboardButton("🔙 Back to Bonuses", callback_data="main_bonuses")]]
+        await safe_edit_message(update.callback_query, msg, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text("You haven't wagered anything in the last 30 days to claim a monthly bonus.")
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 @check_banned
 @check_maintenance
@@ -17490,36 +17854,41 @@ async def rakeback_command(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     await ensure_user_in_wallets(user.id, user.username, context=context)
     stats = user_stats[user.id]
     
-    total_wagered = stats.get("bets", {}).get("amount", 0.0)
-    last_claim_wager = stats.get("last_rakeback_claim_wager", 0.0)
+    rakeback_balance = stats.get("rakeback_balance", 0.0)
     
-    wagered_since_last_claim = total_wagered - last_claim_wager
-    
-    if wagered_since_last_claim <= 0:
-        message = "You have no new wagers to claim rakeback on. Play some games!"
+    if rakeback_balance <= 0:
+        message = "You have no rakeback to claim. Play some games to accumulate rakeback!" + get_username_bonus_guidance()
         if from_callback:
-            await update.callback_query.answer(message, show_alert=True)
+            await update.callback_query.answer("No rakeback available. Play more games!", show_alert=True)
         else:
-            await update.message.reply_text(message)
+            await update.message.reply_text(message, parse_mode=ParseMode.HTML)
         return
-        
-    current_level = get_user_level(user.id)
-    rakeback_percentage = current_level["rakeback_percentage"] / 100 # Convert from 1% to 0.01
     
-    rakeback_amount = wagered_since_last_claim * rakeback_percentage
+    # Apply username bonus (5% extra if user has bot username in name)
+    final_amount = apply_username_bonus(rakeback_balance, user.id)
+    has_bonus = check_username_bonus(user.id)
     
-    user_wallets[user.id] += rakeback_amount
-    stats["last_rakeback_claim_wager"] = total_wagered
+    user_wallets[user.id] += final_amount
+    stats["rakeback_balance"] = 0.0
     save_user_data(user.id)
     
-    message = f"💰 You have claimed ${rakeback_amount:.4f} in rakeback from ${wagered_since_last_claim:.2f} wagered at a rate of {current_level['rakeback_percentage']}%."
+    bonus_text = ""
+    if has_bonus:
+        bonus_text = f"\n🎉 <b>Username Bonus Applied!</b> +5% extra (${final_amount - rakeback_balance:.4f})"
+    
+    current_level = get_user_level(user.id)
+    message = (
+        f"💰 <b>Rakeback Claimed!</b>\n\n"
+        f"Amount: <b>${final_amount:.4f}</b>{bonus_text}\n"
+        f"VIP Tier: {current_level['name']} ({current_level['rakeback_percentage']}% rakeback rate)"
+        + get_username_bonus_guidance()
+    )
     
     if from_callback:
-        # Go back to the bonuses menu after claiming
         keyboard = [[InlineKeyboardButton("🔙 Back to Bonuses", callback_data="main_bonuses")]]
-        await update.callback_query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.callback_query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(f"💰 You have claimed ${rakeback_amount:.4f} in rakeback from ${wagered_since_last_claim:.2f} wagered.")
+        await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 # --- NEW Gift Code System ---
 async def admin_gift_code_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
